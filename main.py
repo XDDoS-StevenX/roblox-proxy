@@ -11,7 +11,6 @@ HEADERS = {
 @app.route("/recent-accessories")
 def recent_accessories():
     try:
-        # Paso 1: obtener IDs recientes
         r1 = requests.get(
             "https://catalog.roblox.com/v1/search/items",
             params={
@@ -29,7 +28,6 @@ def recent_accessories():
         if not entries:
             return jsonify({"success": True, "items": [], "count": 0})
 
-        # Paso 2: obtener detalles (nombre, precio) por lote
         item_list = [{"itemType": e["itemType"], "id": e["id"]} for e in entries]
         r2 = requests.post(
             "https://catalog.roblox.com/v1/catalog/items/details",
@@ -52,6 +50,34 @@ def recent_accessories():
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/debug2")
+def debug2():
+    try:
+        # Paso 1
+        r1 = requests.get(
+            "https://catalog.roblox.com/v1/search/items",
+            params={"category": "Accessories", "sortType": 3, "limit": 5},
+            headers=HEADERS,
+            timeout=10
+        )
+        entries = r1.json().get("data", [])
+
+        # Paso 2 - ver respuesta raw
+        item_list = [{"itemType": e["itemType"], "id": e["id"]} for e in entries]
+        r2 = requests.post(
+            "https://catalog.roblox.com/v1/catalog/items/details",
+            json={"items": item_list},
+            headers={**HEADERS, "Content-Type": "application/json"},
+            timeout=10
+        )
+        return jsonify({
+            "step1_entries": entries,
+            "step2_status": r2.status_code,
+            "step2_raw": r2.json()
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/ping")
 def ping():
