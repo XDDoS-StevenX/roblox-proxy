@@ -6,7 +6,7 @@ Endpoints:
   GET /ping                         → health check (anti-sleep)
   GET /item?id=ASSET_ID             → info de un solo item
   GET /items?ids=ID1,ID2,...        → info de varios items (máx 120)
-  GET /recent-accessories           → lista de accesorios recientes (Hats + Accessories)
+  GET /recent-accessories           → lista de accesorios recientes
   GET /search?keyword=TEXTO         → búsqueda por nombre
 """
 
@@ -17,7 +17,7 @@ import time
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Cache simple en memoria  (key → {data, expires_at})
+# Cache simple en memoria
 # ---------------------------------------------------------------------------
 _cache: dict = {}
 CACHE_TTL = 300  # 5 minutos
@@ -35,7 +35,7 @@ def _cache_set(key, data):
 
 
 # ---------------------------------------------------------------------------
-# Headers comunes — imita un navegador para evitar bloqueos
+# Headers — imita navegador
 # ---------------------------------------------------------------------------
 HEADERS = {
     "User-Agent": (
@@ -46,74 +46,80 @@ HEADERS = {
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.roblox.com/",
-    "Origin": "https://www.roblox.com",
 }
 
 
 # ---------------------------------------------------------------------------
-# Función principal: obtener detalles de items por ID
-# Usa economy.roblox.com — funciona sin cookies ni XSRF
+# Obtener info de un item usando la API pública de marketplace
 # ---------------------------------------------------------------------------
-def fetch_item_details(asset_ids: list[int]) -> list[dict]:
+def fetch_single_item(asset_id: int) -> dict | None:
     """
-    Llama a economy.roblox.com/v2/assets/details (POST) para obtener
-    nombre, precio, tipo y creador de cada asset.
-    Máximo 120 IDs por request.
+    Usa la API pública de Roblox que no requiere XSRF ni cookies.
+    Endpoint: https://api.roblox.com/marketplace/productinfo
+    """
+    try:
+        resp = requests.get(
+            f"https://api.roblox.com/marketplace/productinfo?assetId={asset_id}",
+            headers=HEADERS,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            d = resp.json()
+            return {
+                "id": asset_id,
+                "name": d.get("Name", "Unknown"),
+                "price": d.get("PriceInRobux") or 0,
+                "creator": d.get("Creator", {}).get("Name", "Roblox"),
+                "thumbnail": f"https://www.roblox.com/asset-thumbnail/image?assetId={asset_id}&width=420&height=420&format=png",
+            }
+    except Exception as e:
+        print(f"[fetch_single_item] {asset_id}: {e}")
+    return None
+
+
+def fetch_item_details(asset_ids: list) -> list:
+    """
+    Llama a la API de thumbnails para verificar existencia,
+    y productinfo para precio/nombre.
     """
     results = []
-    # Procesar en lotes de 120
-    for i in range(0, len(asset_ids), 120):
-        batch = asset_ids[i:i + 120]
-        try:
-            resp = requests.post(
-                "https://economy.roblox.com/v2/assets/details",
-                json={"assetIds": batch},
-                headers=HEADERS,
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                for item in data:
-                    results.append({
-                        "id": item.get("AssetId"),
-                        "name": item.get("Name", "Unknown"),
-                        "price": item.get("PriceInRobux") or 0,
-                        "type": item.get("AssetTypeId"),
-                        "creator": item.get("Creator", {}).get("Name", "Roblox"),
-                        "thumbnail": f"https://www.roblox.com/asset-thumbnail/image?assetId={item.get('AssetId')}&width=420&height=420&format=png",
-                    })
-        except Exception as e:
-            print(f"[fetch_item_details] batch error: {e}")
+    for asset_id in asset_ids:
+        cached = _cache_get(f"item:{asset_id}")
+        if cached:
+            results.append(cached)
+            continue
+        item = fetch_single_item(asset_id)
+        if item:
+            _cache_set(f"item:{asset_id}", item)
+            results.append(item)
     return results
 
 
 # ---------------------------------------------------------------------------
 # Búsqueda en el catálogo
-# Usa catalog.roblox.com/v1/search/items con subcategory de sombreros/accesorios
 # ---------------------------------------------------------------------------
-def search_catalog(keyword: str = "", category: str = "Accessories", limit: int = 30) -> list[int]:
+def search_catalog(keyword: str = "", subcategory: str = "", limit: int = 30) -> list:
     """
-    Devuelve una lista de asset IDs del catálogo.
-    category: 'Accessories', 'Hats', 'All'
+    Busca en el catálogo y devuelve lista de items con detalles.
+    Usa catalog.roblox.com/v1/search/items — devuelve IDs,
+    luego fetchea detalles con productinfo.
     """
-    cache_key = f"search:{keyword}:{category}:{limit}"
+    cache_key = f"search:{keyword}:{subcategory}:{limit}"
     cached = _cache_get(cache_key)
-    if cached:
+    if cached is not None:
         return cached
 
     params = {
-        "limit": limit,
-        "sortType": 2,           # Relevance
+        "limit": min(limit, 30),
+        "sortType": 3,  # Recently updated
         "includeNotForSale": "false",
     }
     if keyword:
         params["keyword"] = keyword
-    if category == "Hats":
-        params["subcategory"] = "ClassicHats"
-    elif category == "Accessories":
-        params["subcategory"] = "Accessories"
-    # 'All' → sin subcategory
+    if subcategory:
+        params["subcategory"] = subcategory
 
+    ids = []
     try:
         resp = requests.get(
             "https://catalog.roblox.com/v1/search/items",
@@ -124,11 +130,17 @@ def search_catalog(keyword: str = "", category: str = "Accessories", limit: int 
         if resp.status_code == 200:
             data = resp.json().get("data", [])
             ids = [item["id"] for item in data if "id" in item]
-            _cache_set(cache_key, ids)
-            return ids
     except Exception as e:
         print(f"[search_catalog] error: {e}")
-    return []
+
+    if not ids:
+        _cache_set(cache_key, [])
+        return []
+
+    # Fetchear detalles de cada ID
+    results = fetch_item_details(ids)
+    _cache_set(cache_key, results)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -137,39 +149,29 @@ def search_catalog(keyword: str = "", category: str = "Accessories", limit: int 
 
 @app.route("/ping")
 def ping():
-    """Health check — llamar cada 10 min desde cron-job.org para no dormir."""
     return jsonify({"status": "ok", "time": time.time()})
 
 
 @app.route("/item")
 def get_item():
-    """
-    GET /item?id=ASSET_ID
-    Devuelve info de un solo item.
-    """
     asset_id = request.args.get("id", type=int)
     if not asset_id:
         return jsonify({"error": "Missing ?id=ASSET_ID"}), 400
 
-    cache_key = f"item:{asset_id}"
-    cached = _cache_get(cache_key)
+    cached = _cache_get(f"item:{asset_id}")
     if cached:
         return jsonify(cached)
 
-    results = fetch_item_details([asset_id])
-    if not results:
+    item = fetch_single_item(asset_id)
+    if not item:
         return jsonify({"error": "Item not found"}), 404
 
-    _cache_set(cache_key, results[0])
-    return jsonify(results[0])
+    _cache_set(f"item:{asset_id}", item)
+    return jsonify(item)
 
 
 @app.route("/items")
 def get_items():
-    """
-    GET /items?ids=ID1,ID2,ID3,...
-    Devuelve info de varios items. Máx 120.
-    """
     ids_param = request.args.get("ids", "")
     if not ids_param:
         return jsonify({"error": "Missing ?ids=ID1,ID2,..."}), 400
@@ -182,66 +184,41 @@ def get_items():
     if len(asset_ids) > 120:
         return jsonify({"error": "Max 120 IDs per request"}), 400
 
-    cache_key = f"items:{ids_param}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return jsonify(cached)
-
     results = fetch_item_details(asset_ids)
-    _cache_set(cache_key, results)
     return jsonify(results)
 
 
 @app.route("/recent-accessories")
 def recent_accessories():
-    """
-    GET /recent-accessories
-    Devuelve los 30 accesorios más recientes del catálogo (Hats + Accessories).
-    Ideal para poblar el AccessoryShopGui automáticamente.
-    """
-    cache_key = "recent-accessories"
-    cached = _cache_get(cache_key)
-    if cached:
+    cached = _cache_get("recent-accessories")
+    if cached is not None:
         return jsonify(cached)
 
     # Buscar hats y accesorios por separado y mezclar
-    hat_ids = search_catalog(category="Hats", limit=15)
-    acc_ids = search_catalog(category="Accessories", limit=15)
+    hats = search_catalog(subcategory="ClassicHats", limit=15)
+    accs = search_catalog(subcategory="Accessories", limit=15)
 
-    all_ids = list(dict.fromkeys(hat_ids + acc_ids))  # deduplicar preservando orden
+    # Deduplicar por id
+    seen = set()
+    combined = []
+    for item in hats + accs:
+        if item["id"] not in seen:
+            seen.add(item["id"])
+            combined.append(item)
 
-    if not all_ids:
-        return jsonify([])
-
-    results = fetch_item_details(all_ids)
-    _cache_set(cache_key, results)
-    return jsonify(results)
+    _cache_set("recent-accessories", combined)
+    return jsonify(combined)
 
 
 @app.route("/search")
 def search():
-    """
-    GET /search?keyword=TEXTO&limit=20
-    Busca accesorios por nombre y devuelve detalles completos.
-    """
     keyword = request.args.get("keyword", "").strip()
-    limit = request.args.get("limit", 20, type=int)
-    limit = min(limit, 60)  # cap
+    limit = min(request.args.get("limit", 20, type=int), 60)
 
     if not keyword:
         return jsonify({"error": "Missing ?keyword=TEXTO"}), 400
 
-    cache_key = f"search-full:{keyword}:{limit}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return jsonify(cached)
-
-    ids = search_catalog(keyword=keyword, category="All", limit=limit)
-    if not ids:
-        return jsonify([])
-
-    results = fetch_item_details(ids)
-    _cache_set(cache_key, results)
+    results = search_catalog(keyword=keyword, limit=limit)
     return jsonify(results)
 
 
